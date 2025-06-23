@@ -1,78 +1,100 @@
-from youtube_transcript_api import YouTubeTranscriptApi , TranscriptsDisabled
+import streamlit as st
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings , ChatGoogleGenerativeAI
-
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableParallel , RunnableLambda , RunnablePassthrough
+from langchain_core.runnables import RunnableParallel, RunnableLambda, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+import os
+import re
+from dotenv import load_dotenv
 
-# Indexing (Document ingestion)
-
-video_id = 'Gfr50f6ZBvo'  #only the id not full url
-try:
-    transcript_list = YouTubeTranscriptApi.get_transcript(video_id , languages=['en']) 
-    
-    #flatten it to plain text
-    
-    transcript = " ".join(chunk["text"] for chunk in transcript_list)
-    
-    
-except TranscriptsDisabled :
-    print("Transcripts are disabled for this video.")
-    
-# Indexing (text splitting)
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200
-)
-chunks = splitter.create_documents([transcript])
-    
-# Indexing (embedding generation and storing in vector store)
-
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-vector_store = FAISS.from_documents(
-    chunks,
-    embeddings
-)
+load_dotenv()
 
 
-# Retrieval (searching for relevant chunks)
-retriever = vector_store.as_retriever(search_type = "similarity" ,search_kwargs={"k": 4})
+st.set_page_config(page_title="YT_chats", layout="centered")
 
-# Augmentation
-model= ChatGoogleGenerativeAI(model = 'gemini-2.5-flash-preview-04-17', temperature=0.7 )
+st.title("📺 YT_chats 🤖")
+st.markdown("Enter a YouTube URL and ask questions about the video content.")
 
-prompt = PromptTemplate(
-    input_variables=["context" , "question"],
-    template=" You are an helpful assistant , Answer the question based on the context below. If the answer is not in the context, say 'I don't know'.\n\nContext: {context}\n\nQuestion: {question}\n\nAnswer:"
-)
-question          = "is the topic of nuclear fusion discussed in this video? if yes then what was discussed"
-retrieved_docs    = retriever.invoke(question)
+# Step 1: Input YouTube URL
+youtube_url = st.text_input("Enter YouTube video URL")
 
-def format_docs(retrived_docs):
-    context_text = "\n\n".join([doc.page_content for doc in retrived_docs])
-    return context_text
+def extract_video_id(url):
+  
+    match = re.search(r"(?:v=|youtu\.be/)([^&]+)", url)
+    return match.group(1) if match else None
 
+# Initialize session state
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
 
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# Build a chain
+if youtube_url:
+    video_id = extract_video_id(youtube_url)
+    if video_id:
+        try:
+            st.info("Fetching transcript...")
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            transcript = " ".join(chunk["text"] for chunk in transcript_list)
 
-parallel_chain = RunnableParallel(
-    {
-        "context": retriever | RunnableLambda(format_docs),
-        "question": RunnablePassthrough()
-    }
-   
-)
+            # Split text
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = splitter.create_documents([transcript])
 
-parser = StrOutputParser()
+            # Generate embeddings and vector store
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            vector_store = FAISS.from_documents(chunks, embeddings)
+            retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+            st.session_state.vector_store = retriever
+            st.success("Transcript indexed successfully! You can now chat about the video.")
+        except TranscriptsDisabled:
+            st.error("Transcripts are disabled for this video.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+    else:
+        st.warning("Invalid YouTube URL.")
 
-main_chain = parallel_chain | prompt | model | parser
+# Step 2: Chat Interface
+if st.session_state.vector_store:
+    user_input = st.chat_input("Ask a question about the video...")
 
-result = main_chain.invoke('can u summarise the video')
+    if user_input:
+        retriever = st.session_state.vector_store
 
-print(result)
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
 
+        # Prompt template
+        prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template=(
+                "You are a helpful assistant. Answer the question based on the context below.\n\n"
+                "Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+            )
+        )
 
+        # Chain setup
+        parallel_chain = RunnableParallel({
+            "context": retriever | RunnableLambda(format_docs),
+            "question": RunnablePassthrough()
+        })
+
+        parser = StrOutputParser()
+        model = ChatGoogleGenerativeAI(model="gemini-2.5-flash-preview-04-17", temperature=0.7)
+        main_chain = parallel_chain | prompt | model | parser
+
+        # Invoke the chain
+        response = main_chain.invoke(user_input)
+
+        # Update chat history
+        st.session_state.chat_history.append(("user", user_input))
+        st.session_state.chat_history.append(("bot", response))
+
+    # Display chat history
+    for speaker, message in st.session_state.chat_history:
+        with st.chat_message(speaker):
+            st.markdown(message)
